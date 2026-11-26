@@ -16,5 +16,4 @@ thiserror = "2"
 uuid = { version = "1", features = ["serde", "v7"] }
 
 [dev-dependencies]
-rsa = { version = "0.9", features = ["pem"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

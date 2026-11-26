@@ -116,8 +116,7 @@ mod tests {
 
     #[tokio::test]
     async fn fetches_jwks_once_and_serves_cached_keys() {
-        let body =
-            r#"{"keys":[{"kty":"oct","kid":"test-kid","alg":"HS256","k":"c2VjcmV0"}]}"#.to_owned();
+        let body = r#"{"keys":[{"kty":"EC","crv":"P-256","kid":"test-kid","alg":"ES256","use":"sig","x":"tEcyToZMoUpSWYL6-6ap57b4kITFhdUUaK5ca529vLQ","y":"Hyh3fRGqJQ9gwznu6-8j1p-x1EuMak-U9r5MepcoK9k"}]}"#.to_owned();
         let (url, server) = spawn_jwks_server(body);
 
         let mut config = ClientConfig::new("http://core.example", uuid::Uuid::now_v7());
