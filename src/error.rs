@@ -17,6 +17,9 @@ pub enum ClientError {
     #[error("Core returned HTTP {status}: {message}")]
     Api { status: u16, message: String },
 
+    #[error("propagation failed: {0}")]
+    Propagation(String),
+
     #[error("cache lock was poisoned")]
     Lock,
 }

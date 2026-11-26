@@ -1,5 +1,8 @@
+use base64::Engine as _;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use jsonwebtoken::jwk::{Jwk, KeyAlgorithm};
 use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode, decode_header};
+use sha2::{Digest, Sha256};
 
 use crate::error::{ClientError, Result};
 use crate::types::ServiceAccessTokenClaims;
@@ -14,6 +17,16 @@ pub fn validate_with_jwk(
     jwk: &Jwk,
     expected_audience: Option<&str>,
     expected_issuer: Option<&str>,
+) -> Result<ServiceAccessTokenClaims> {
+    validate_with_jwk_and_certificate(token, jwk, expected_audience, expected_issuer, None)
+}
+
+pub fn validate_with_jwk_and_certificate(
+    token: &str,
+    jwk: &Jwk,
+    expected_audience: Option<&str>,
+    expected_issuer: Option<&str>,
+    expected_certificate_fingerprint: Option<&[u8]>,
 ) -> Result<ServiceAccessTokenClaims> {
     let decoding_key =
         DecodingKey::from_jwk(jwk).map_err(|error| ClientError::Token(error.to_string()))?;
@@ -40,7 +53,51 @@ pub fn validate_with_jwk(
         return Err(ClientError::Token("invalid issuer".to_owned()));
     }
 
+    if let Some(expected_fingerprint) = expected_certificate_fingerprint {
+        let claim = claims
+            .cnf
+            .as_ref()
+            .ok_or_else(|| ClientError::Token("token is not certificate-bound".to_owned()))?;
+        let actual_fingerprint = URL_SAFE_NO_PAD
+            .decode(&claim.x5t_s256)
+            .map_err(|_| ClientError::Token("invalid certificate thumbprint".to_owned()))?;
+        if actual_fingerprint.as_slice() != expected_fingerprint {
+            return Err(ClientError::Token(
+                "token is bound to a different certificate".to_owned(),
+            ));
+        }
+    }
+
     Ok(claims)
+}
+
+/// Compute the SHA-256 fingerprint of the first X.509 certificate in a PEM
+/// bundle. This is the value compared with `cnf.x5t#S256`.
+pub fn certificate_fingerprint_sha256(certificate_pem: &str) -> Result<Vec<u8>> {
+    let mut in_certificate = false;
+    let mut encoded = String::new();
+    for line in certificate_pem.lines() {
+        let trimmed = line.trim();
+        if trimmed.contains("BEGIN CERTIFICATE") {
+            in_certificate = true;
+            continue;
+        }
+        if trimmed.contains("END CERTIFICATE") {
+            break;
+        }
+        if in_certificate {
+            encoded.push_str(trimmed);
+        }
+    }
+    if encoded.is_empty() {
+        return Err(ClientError::Token(
+            "client certificate is missing PEM data".to_owned(),
+        ));
+    }
+    let der = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .map_err(|_| ClientError::Token("client certificate PEM is invalid".to_owned()))?;
+    Ok(Sha256::digest(der).to_vec())
 }
 
 fn algorithm_for_jwk(jwk: &Jwk, token: &str) -> Result<Algorithm> {
@@ -66,6 +123,7 @@ fn algorithm_for_jwk(jwk: &Jwk, token: &str) -> Result<Algorithm> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::CnfClaim;
     use jsonwebtoken::jwk::{
         AlgorithmParameters, CommonParameters, EllipticCurve, EllipticCurveKeyParameters,
         EllipticCurveKeyType, PublicKeyUse,
@@ -166,5 +224,66 @@ XmI5ssMlxY53Sb8aUMnGAqtuXkihRANCAAS0RzJOhkyhSlJZgvr7pqnntviQhMWF\n\
 
         let result = validate_with_jwk(&token, &test_jwk(), None, Some("panchayat-core"));
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn accepts_matching_certificate_binding() {
+        let fingerprint = [7u8; 32];
+        let mut claims = test_claims("panchayat-core", "receiving-service");
+        claims.cnf = Some(CnfClaim {
+            x5t_s256: URL_SAFE_NO_PAD.encode(fingerprint),
+        });
+        let token = signed_token(&claims);
+
+        let validated = validate_with_jwk_and_certificate(
+            &token,
+            &test_jwk(),
+            Some("receiving-service"),
+            Some("panchayat-core"),
+            Some(&fingerprint),
+        )
+        .expect("matching certificate should validate");
+        assert_eq!(
+            validated.certificate_thumbprint(),
+            claims.certificate_thumbprint()
+        );
+    }
+
+    #[test]
+    fn rejects_certificate_binding_mismatch_and_missing_binding() {
+        let fingerprint = [7u8; 32];
+        let mut claims = test_claims("panchayat-core", "receiving-service");
+        claims.cnf = Some(CnfClaim {
+            x5t_s256: URL_SAFE_NO_PAD.encode(fingerprint),
+        });
+        let token = signed_token(&claims);
+
+        assert!(
+            validate_with_jwk_and_certificate(
+                &token,
+                &test_jwk(),
+                None,
+                Some("panchayat-core"),
+                Some(&[8u8; 32]),
+            )
+            .is_err()
+        );
+
+        let unbound = signed_token(&test_claims("panchayat-core", "receiving-service"));
+        assert!(
+            validate_with_jwk_and_certificate(
+                &unbound,
+                &test_jwk(),
+                None,
+                Some("panchayat-core"),
+                Some(&fingerprint),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn certificate_fingerprint_requires_a_certificate() {
+        assert!(certificate_fingerprint_sha256("not a certificate").is_err());
     }
 }

@@ -20,6 +20,12 @@ pub struct ServiceAccessTokenClaims {
     pub cnf: Option<CnfClaim>,
 }
 
+impl ServiceAccessTokenClaims {
+    pub fn certificate_thumbprint(&self) -> Option<&str> {
+        self.cnf.as_ref().map(|claim| claim.x5t_s256.as_str())
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CnfClaim {
     #[serde(rename = "x5t#S256")]
@@ -131,6 +137,9 @@ pub struct ClientConfig {
     pub client_key_pem: Option<String>,
     pub access_token: Option<String>,
     pub token_refresh_skew_seconds: i64,
+    pub default_operations: Vec<String>,
+    pub checkpoint_max_age_seconds: i64,
+    pub checkpoint_future_skew_seconds: i64,
 }
 
 impl ClientConfig {
@@ -140,11 +149,17 @@ impl ClientConfig {
             jwks_url: None,
             service_id,
             principal_id: None,
-            default_audience: "panchayat-core".to_owned(),
+            default_audience: "core".to_owned(),
             client_cert_pem: None,
             client_key_pem: None,
             access_token: None,
             token_refresh_skew_seconds: 30,
+            default_operations: vec![
+                "service_trust.recipient.read".to_owned(),
+                "service_trust.recipient.acknowledge".to_owned(),
+            ],
+            checkpoint_max_age_seconds: 300,
+            checkpoint_future_skew_seconds: 60,
         }
     }
 }
@@ -152,6 +167,7 @@ impl ClientConfig {
 #[derive(Debug, Clone, Default)]
 pub struct SyncReport {
     pub deliveries_seen: usize,
+    pub deliveries_applied: usize,
     pub deliveries_acknowledged: usize,
 }
 
@@ -192,7 +208,14 @@ mod tests {
     #[test]
     fn client_config_defaults_are_safe() {
         let config = ClientConfig::new("http://core.example", Uuid::now_v7());
-        assert_eq!(config.default_audience, "panchayat-core");
+        assert_eq!(config.default_audience, "core");
         assert!(config.access_token.is_none());
+        assert_eq!(config.checkpoint_max_age_seconds, 300);
+        assert!(
+            config
+                .default_operations
+                .iter()
+                .any(|value| value == "service_trust.recipient.read")
+        );
     }
 }

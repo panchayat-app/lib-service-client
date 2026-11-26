@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 
 use chrono::{Duration, Utc};
-use reqwest::Client;
+use reqwest::{Client, Identity};
 use uuid::Uuid;
 
 use crate::error::{ClientError, Result};
@@ -14,6 +14,8 @@ use crate::types::{
     ClientConfig, IssueWorkloadTokenRequest, OutboxDeliveryStatus, RecipientCheckpoint,
     RecipientDelivery, ServiceAccessTokenClaims, SyncReport, WorkloadToken, WorkloadTokenResponse,
 };
+
+const DELIVERY_PAGE_SIZE: usize = 100;
 
 #[derive(Clone, PartialEq, Eq, Hash)]
 struct TokenCacheKey {
@@ -30,7 +32,32 @@ pub struct ServiceClient {
 
 impl ServiceClient {
     pub fn new(config: ClientConfig) -> Result<Self> {
-        let http = Client::builder().build().map_err(ClientError::Http)?;
+        let mut builder = Client::builder();
+
+        match (
+            config.client_cert_pem.as_deref(),
+            config.client_key_pem.as_deref(),
+        ) {
+            (Some(certificate), Some(key)) => {
+                let identity_pem = format!("{}\n{}\n", certificate.trim(), key.trim());
+                let identity =
+                    Identity::from_pem(identity_pem.as_bytes()).map_err(ClientError::Http)?;
+                builder = builder.identity(identity);
+            }
+            (Some(_), None) => {
+                return Err(ClientError::Config(
+                    "client_key_pem is required when client_cert_pem is configured".to_owned(),
+                ));
+            }
+            (None, Some(_)) => {
+                return Err(ClientError::Config(
+                    "client_cert_pem is required when client_key_pem is configured".to_owned(),
+                ));
+            }
+            (None, None) => {}
+        }
+
+        let http = builder.build().map_err(ClientError::Http)?;
         let jwks = JwksCache::new(&config, http.clone());
         Ok(Self {
             config,
@@ -57,6 +84,29 @@ impl ServiceClient {
         token: &str,
         expected_audience: Option<&str>,
     ) -> Result<ServiceAccessTokenClaims> {
+        self.validate_token(token, expected_audience, None).await
+    }
+
+    /// Validate a token and require its `cnf.x5t#S256` thumbprint to match the
+    /// X.509 certificate presented by the caller. Recipients should use this
+    /// method when authenticating service-to-service requests.
+    pub async fn validate_access_token_for_certificate(
+        &self,
+        token: &str,
+        expected_audience: Option<&str>,
+        certificate_pem: &str,
+    ) -> Result<ServiceAccessTokenClaims> {
+        let fingerprint = token::certificate_fingerprint_sha256(certificate_pem)?;
+        self.validate_token(token, expected_audience, Some(&fingerprint))
+            .await
+    }
+
+    async fn validate_token(
+        &self,
+        token: &str,
+        expected_audience: Option<&str>,
+        expected_certificate_fingerprint: Option<&[u8]>,
+    ) -> Result<ServiceAccessTokenClaims> {
         let kid = token::decode_header_kid(token)?;
         let keys = self.jwks.get_for_kid(kid.as_deref()).await?;
 
@@ -70,7 +120,13 @@ impl ServiceClient {
             return Err(ClientError::Token("token is missing a key id".to_owned()));
         };
 
-        token::validate_with_jwk(token, &jwk, expected_audience, Some("panchayat-core"))
+        token::validate_with_jwk_and_certificate(
+            token,
+            &jwk,
+            expected_audience,
+            Some("panchayat-core"),
+            expected_certificate_fingerprint,
+        )
     }
 
     pub async fn issue_workload_token(
@@ -87,18 +143,11 @@ impl ServiceClient {
             request.audience = self.config.default_audience.clone();
         }
 
-        let principal_id = request.principal_id.or(self.config.principal_id);
+        let principal_id = request.principal_id.ok_or_else(|| {
+            ClientError::Config("principal_id is required to issue a workload token".to_owned())
+        })?;
         let base = self.config.core_base_url.trim_end_matches('/');
-        let url = match principal_id {
-            Some(id) => format!("{base}/v1/service-principals/{id}/workload-token"),
-            None => format!("{base}/v1/service-workload-tokens"),
-        };
-
-        if principal_id.is_none() && request.principal_id.is_none() {
-            return Err(ClientError::Config(
-                "principal_id is required to issue a workload token".to_owned(),
-            ));
-        }
+        let url = format!("{base}/v1/service-principals/{principal_id}/workload-token");
 
         let response = self.http.post(&url).json(&request).send().await?;
         if !response.status().is_success() {
@@ -153,7 +202,14 @@ impl ServiceClient {
         if let Some(token) = &self.config.access_token {
             return Ok(token.clone());
         }
-        self.workload_token(None, Vec::new(), None).await
+        if self.config.default_operations.is_empty() {
+            return Err(ClientError::Config(
+                "default_operations must not be empty when no access_token is configured"
+                    .to_owned(),
+            ));
+        }
+        self.workload_token(None, self.config.default_operations.clone(), None)
+            .await
     }
 
     pub async fn checkpoint(&self) -> Result<RecipientCheckpoint> {
@@ -179,6 +235,24 @@ impl ServiceClient {
     }
 
     pub async fn deliveries(&self) -> Result<Vec<RecipientDelivery>> {
+        let mut deliveries = Vec::new();
+        let mut offset = 0usize;
+
+        loop {
+            let page = self.deliveries_page(DELIVERY_PAGE_SIZE, offset).await?;
+            let page_len = page.len();
+            deliveries.extend(page);
+            if page_len < DELIVERY_PAGE_SIZE {
+                break;
+            }
+            offset += page_len;
+        }
+
+        deliveries.sort_by_key(|delivery| delivery.recipient_revision);
+        Ok(deliveries)
+    }
+
+    async fn deliveries_page(&self, limit: usize, offset: usize) -> Result<Vec<RecipientDelivery>> {
         let token = self.bearer_token().await?;
         let url = format!(
             "{}/v1/service-recipients/{}/deliveries",
@@ -189,6 +263,7 @@ impl ServiceClient {
         let response = self
             .http
             .get(&url)
+            .query(&[("limit", limit.to_string()), ("offset", offset.to_string())])
             .header(reqwest::header::AUTHORIZATION, http::bearer(&token))
             .send()
             .await?;
@@ -223,7 +298,29 @@ impl ServiceClient {
         Ok(delivery)
     }
 
-    pub async fn sync_propagation(&self, handler: &dyn PropagationHandler) -> Result<SyncReport> {
+    /// Poll Core, apply every contiguous delivery through `handler`, and
+    /// acknowledge only after the handler has durably committed it.
+    ///
+    /// A stale checkpoint, a revision gap, or a handler error leaves the
+    /// unapplied deliveries unacknowledged and returns an error. Previously
+    /// acknowledged revisions are replayed idempotently when local state is
+    /// behind.
+    pub async fn sync_propagation<H: PropagationHandler + ?Sized>(
+        &self,
+        handler: &H,
+    ) -> Result<SyncReport> {
+        let checkpoint = self.checkpoint().await?;
+        self.validate_checkpoint(&checkpoint)?;
+        handler.record_checkpoint(&checkpoint).await?;
+
+        let mut applied_revision = handler.applied_revision().await?;
+        if applied_revision > checkpoint.latest_revision {
+            return Err(ClientError::Propagation(format!(
+                "local applied revision {applied_revision} is ahead of Core checkpoint {}",
+                checkpoint.latest_revision
+            )));
+        }
+
         let deliveries = self.deliveries().await?;
         let mut report = SyncReport {
             deliveries_seen: deliveries.len(),
@@ -231,26 +328,58 @@ impl ServiceClient {
         };
 
         for delivery in deliveries {
-            if delivery.status == OutboxDeliveryStatus::Acknowledged {
+            if delivery.recipient_revision <= applied_revision {
+                if delivery.status != OutboxDeliveryStatus::Acknowledged {
+                    self.acknowledge(delivery.id).await?;
+                    report.deliveries_acknowledged += 1;
+                }
                 continue;
             }
 
-            if (delivery.aggregate_type.as_deref() == Some("service_principal")
-                || delivery
-                    .event_type
-                    .as_deref()
-                    .map(|value| value.contains("principal"))
-                    .unwrap_or(false))
-                && let (Some(principal_id), Some(version)) =
-                    (delivery.aggregate_id, delivery.aggregate_version)
-            {
-                handler.apply_principal_version(principal_id, version);
+            let expected_revision = applied_revision + 1;
+            if delivery.recipient_revision != expected_revision {
+                return Err(ClientError::Propagation(format!(
+                    "revision gap: expected {expected_revision}, got {}",
+                    delivery.recipient_revision
+                )));
             }
 
-            self.acknowledge(delivery.id).await?;
-            report.deliveries_acknowledged += 1;
+            handler.apply_delivery(&delivery).await?;
+            applied_revision = delivery.recipient_revision;
+            report.deliveries_applied += 1;
+
+            if delivery.status != OutboxDeliveryStatus::Acknowledged {
+                self.acknowledge(delivery.id).await?;
+                report.deliveries_acknowledged += 1;
+            }
+        }
+
+        if applied_revision < checkpoint.latest_revision {
+            return Err(ClientError::Propagation(format!(
+                "local applied revision {applied_revision} has not reached checkpoint {}",
+                checkpoint.latest_revision
+            )));
         }
 
         Ok(report)
+    }
+
+    fn validate_checkpoint(&self, checkpoint: &RecipientCheckpoint) -> Result<()> {
+        let now = Utc::now();
+        if checkpoint.issued_at
+            > now + Duration::seconds(self.config.checkpoint_future_skew_seconds)
+        {
+            return Err(ClientError::Propagation(
+                "checkpoint issue time is in the future".to_owned(),
+            ));
+        }
+        let age = now - checkpoint.issued_at;
+        if age > Duration::seconds(self.config.checkpoint_max_age_seconds) {
+            return Err(ClientError::Propagation(format!(
+                "checkpoint is stale: issued {} seconds ago",
+                age.num_seconds()
+            )));
+        }
+        Ok(())
     }
 }
